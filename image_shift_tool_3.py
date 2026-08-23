@@ -385,7 +385,7 @@ def run(cfg: Config) -> None:
     
     wb.save(log_path)
     print(f"[LOG] Excel 出力完了: {log_path}")
-    print(f"[DONE] {processed}件中 {save}件 保存完了")
+    print(f"[DONE] {processed}件中 {saved}件 保存完了")
     print(f"[SUMMARY] NG: {ng_count}/{processed}件")
     
 
