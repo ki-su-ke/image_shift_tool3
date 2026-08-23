@@ -34,6 +34,7 @@ from datetime import datetime
 
 from PIL import Image
 from openpyxl import Workbook  # pip install openpyxl
+import numpy as np
 
 
 Rect = Tuple[int, int, int, int]  # left, top, right, bottom (半開区間)
@@ -149,6 +150,61 @@ def scan_content_bounds(
     return top_nonwhite, bottom_nonwhite, left_nonwhite
 
 
+def scan_content_bounds_np(
+    img: Image.Image,
+    scan_rect: Rect,
+    exclude_rect: Optional[Rect],
+    white_threshold: int,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    scan_rect 内を走査し、exclude_rect を除いた範囲の
+    top_nonwhite, bottom_nonwhite, left_nonwhite を返す。
+    非白が1つもなければ (None, None, None)。
+    NumPyベクトル化により、300dpiハガキサイズでも高速に動作するかも？
+    """
+    left, top, right, bottom = scan_rect
+    
+    # PIL Image → NumPy配列 (H, W, 3)
+    rgb = img.convert("RGB")
+    arr = np.array(rgb)  # shape: (height, width, 3)
+    
+    # 走査範囲のスライス
+    sub_arr = arr[top:bottom, left:right]  # shape: (height, width, 3)
+    
+    # 非白マスク: いずれかのチャンネルが閾値未満
+    if white_threshold >= 255:
+        mask = np.any(sub_arr < 255, axis=2)  # shape: (height, width)
+    else:
+        mask = np.any(sub_arr < white_threshold, axis=2)
+
+    # 除外矩形のマスク
+    if exclude_rect is not None:
+        ex_left, ex_top, ex_right, ex_bottom = exclude_rect
+        #
+        # グローバル座標 → ローカル座標に変換
+        ex_top_local = max(0, ex_top - top)
+        ex_bottom_local = min(bottom - top, ex_bottom - top)
+        ex_left_local = max(0, ex_left - left)
+        ex_right_local = min(right - left, ex_right - left)
+        
+        if ex_bottom_local > ex_top_local and ex_right_local > ex_left_local:
+            mask[ex_top_local:ex_bottom_local, ex_left_local:ex_right_local] = False
+    
+    # 非白ピクセルのインデックスを取得
+    nonwhite_indices = np.where(mask)
+    
+    if len(nonwhite_indices[0]) == 0:
+        # 非白が1つもない場合なら Tuple[None, None, None] を返す
+        return None, None, None
+    
+    # ローカル座標 → グローバル座標に変換
+    top_nonwhite = int(nonwhite_indices[0].min() + top)
+    bottom_nonwhite = int(nonwhite_indices[0].max() + top)
+    left_nonwhite = int(nonwhite_indices[1].min() + left)
+    
+    return top_nonwhite, bottom_nonwhite, left_nonwhite
+
+
 def shift_rect_up_and_fill_white(
     img: Image.Image,
     rect: Rect,
@@ -205,7 +261,8 @@ def process_image_file(
     # 走査範囲：画像全体から差出人郵便番号枠を除外する想定
     # 必要に応じて走査範囲を絞ってもよい
     scan_rect = (0, 0, width, height)
-    top, bottom, left = scan_content_bounds(img, scan_rect, rect_sender_zip, cfg.white_threshold)
+    # top, bottom, left = scan_content_bounds(img, scan_rect, rect_sender_zip, cfg.white_threshold)
+    top, bottom, left = scan_content_bounds_np(img, scan_rect, rect_sender_zip, cfg.white_threshold)
     
     # 非白がなければ何もしない
     if top is None or bottom is None:
@@ -263,14 +320,16 @@ def process_image_file(
                 move_rect[0],
                 move_rect[1] - moved,
                 move_rect[2],
-                
+                move_rect[3] - moved,
             )
-            current = shift_rect_up_and_fill_white(current, move_rect2, cfg.y_space)
-            moved += cfg.y_space
+            move_rect2 = clip_rect_to_image(move_rect2, width, height)
+            if move_rect2:
+                current = shift_rect_up_and_fill_white(current, move_rect2, cfg.y_space)
+                moved += cfg.y_space
         else:
-            # y_space を足すと上限超過 → NG にするか、足さないか
-            # ここでは足さない（安全側）
-            print(f"[WARN] y_spaceを追加すると上限超過のためスキップ: {path.name}")
+            # y_space を足すと上限超過 → NG にする
+            # print(f"[WARN] y_spaceを追加すると上限超過のためスキップ: {path.name}")
+            return False, "NG", moved, "y-space-clip-failed"
     
     # 保存
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -308,7 +367,7 @@ def run(cfg: Config) -> None:
     ws = wb.active
     ws.append(["filename", "result", "moved_px", "reason"])
     
-    processed = save = ng_count = 0
+    processed = saveed = ng_count = 0
     for p in files:
         processed += 1
         rel_dir = p.parent.relative_to(cfg.input_dir)
