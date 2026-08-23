@@ -367,7 +367,7 @@ def run(cfg: Config) -> None:
     ws = wb.active
     ws.append(["filename", "result", "moved_px", "reason"])
     
-    processed = saveed = ng_count = 0
+    processed = saved = ng_count = 0
     for p in files:
         processed += 1
         rel_dir = p.parent.relative_to(cfg.input_dir)
