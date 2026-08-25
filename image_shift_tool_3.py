@@ -400,16 +400,20 @@ def process_image_file(
         new_top2 = top - moved - cfg.y_space
         if new_top2 >= cfg.upper_limit_y:
             # 追加移動後の矩形
-            move_rect2 = (
+            move_rect2_raw = (
                 move_rect[0],
                 move_rect[1] - moved,
                 move_rect[2],
                 move_rect[3] - moved,
             )
-            move_rect2 = clip_rect_to_image(move_rect2, width, height)
-            if move_rect2:
-                current = shift_rect_up_and_fill_white(current, move_rect2, cfg.y_space)
-                moved += cfg.y_space
+            move_rect2 = clip_rect_to_image(move_rect2_raw, width, height)
+            # 画像外にはみ出してクリップが必要なケースは非定型としてNG扱い
+            if move_rect2 is None or move_rect2 != move_rect2_raw:
+                saved = save_ng_images(img, current, out_dir, path)
+                return saved, "NG", moved, "y-space-clip-failed"
+
+            current = shift_rect_up_and_fill_white(current, move_rect2, cfg.y_space)
+            moved += cfg.y_space
         else:
             # y_space を足すと上限超過 → NG にする
             # print(f"[WARN] y_spaceを追加すると上限超過のためスキップ: {path.name}")
