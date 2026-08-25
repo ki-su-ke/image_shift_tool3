@@ -45,7 +45,6 @@ class Config:
     input_dir: Path
     rect1: Rect                     # 監視矩形（ここには文字を残さない）
     upper_limit_y: int              # 郵便番号枠下端（これより上に出てはいけない）
-    scan_top_y: Optional[int] = None  # 走査領域の上端（Noneなら upper_limit_y を使用）
     sender_zip_rect: Rect           # 差出人郵便番号枠（走査から除外）
     left_limit_x: int = 0           # 移動対象の左端（決め打ち）
     right_limit_x: Optional[int] = None  # 移動対象の右端（Noneなら画像右端）
@@ -206,57 +205,6 @@ def scan_content_bounds_np(
     return top_nonwhite, bottom_nonwhite, left_nonwhite
 
 
-def has_nonwhite_on_vertical_band(
-    img: Image.Image,
-    x_center: int,
-    band_half_width: int,
-    y_start: int,
-    y_end: int,
-    white_threshold: int,
-) -> bool:
-    """
-    指定した縦帯に非白画素があるかを判定する。
-    """
-    width, height = img.size
-    x1 = clamp(x_center - band_half_width, 0, width)
-    x2 = clamp(x_center + band_half_width + 1, 0, width)
-    y1 = clamp(y_start, 0, height)
-    y2 = clamp(y_end, 0, height)
-    if x2 <= x1 or y2 <= y1:
-        return False
-
-    arr = np.array(img.convert("RGB"))
-    sub_arr = arr[y1:y2, x1:x2]
-    if white_threshold >= 255:
-        mask = np.any(sub_arr < 255, axis=2)
-    else:
-        mask = np.any(sub_arr < white_threshold, axis=2)
-    return bool(np.any(mask))
-
-
-def save_ng_images(
-    original_img: Image.Image,
-    current_img: Image.Image,
-    out_dir: Path,
-    src_path: Path,
-) -> bool:
-    """
-    NG確認用に元画像と現時点画像を保存する。
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    orig_path = out_dir / f"{src_path.stem}_orig_NG.png"
-    sft_path = out_dir / f"{src_path.stem}_sft_NG.png"
-    try:
-        original_img.convert("RGBA").save(orig_path)
-        current_img.convert("RGBA").save(sft_path)
-    except Exception as e:
-        print(f"[ERROR] NG画像保存失敗: {src_path.name}: {e}")
-        return False
-
-    print(f"[SAVE-NG] {src_path.name} -> {orig_path.name}, {sft_path.name}")
-    return True
-
-
 def shift_rect_up_and_fill_white(
     img: Image.Image,
     rect: Rect,
@@ -304,46 +252,20 @@ def process_image_file(
         return False, "処理不要", None, f"読み込み失敗: {e}"
     
     width, height = img.size
-    current = img
     rect1 = clip_rect_to_image(cfg.rect1, width, height)
     rect_sender_zip = clip_rect_to_image(cfg.sender_zip_rect, width, height)
     
     if not rect1:
         return False, "処理不要", None, "rect1範囲外"
-
-    right_x = cfg.right_limit_x if cfg.right_limit_x is not None else width
-    left_floor = cfg.left_limit_x
-    if rect_sender_zip is not None:
-        left_floor = max(left_floor, rect_sender_zip[2])
-
-    scan_top = cfg.upper_limit_y if cfg.scan_top_y is None else cfg.scan_top_y
-    scan_top = clamp(scan_top, 0, height)
-    scan_rect = clip_rect_to_image((left_floor, scan_top, right_x, height), width, height)
-    if scan_rect is None:
-        saved = save_ng_images(img, current, out_dir, path)
-        return saved, "NG", None, "invalid-scan-rect"
-
-    # 走査領域の左端近傍（±2px）に黒があれば非定型NG
-    if has_nonwhite_on_vertical_band(
-        img=img,
-        x_center=scan_rect[0],
-        band_half_width=2,
-        y_start=scan_rect[1],
-        y_end=scan_rect[3],
-        white_threshold=cfg.white_threshold,
-    ):
-        saved = save_ng_images(img, current, out_dir, path)
-        return saved, "NG", None, "left-boundary-overlap"
-
-    top, bottom, left = scan_content_bounds_np(
-        img,
-        scan_rect,
-        None,
-        cfg.white_threshold,
-    )
+    
+    # 走査範囲：画像全体から差出人郵便番号枠を除外する想定
+    # 必要に応じて走査範囲を絞ってもよい
+    scan_rect = (0, 0, width, height)
+    # top, bottom, left = scan_content_bounds(img, scan_rect, rect_sender_zip, cfg.white_threshold)
+    top, bottom, left = scan_content_bounds_np(img, scan_rect, rect_sender_zip, cfg.white_threshold)
     
     # 非白がなければ何もしない
-    if top is None or bottom is None or left is None:
+    if top is None or bottom is None:
         print(f"[NO-OP] 非白なし: {path.name}")
         return False, "処理不要", None, ""
     
@@ -352,11 +274,6 @@ def process_image_file(
     if bottom < rect1[1] or top >= rect1[3]:
         # rect1と完全に重なっていない
         print(f"[NO-OP] rect1に非白なし: {path.name}")
-        return False, "処理不要", None, ""
-
-    # X方向も重ならないなら移動対象外
-    if scan_rect[2] <= rect1[0] or left >= rect1[2]:
-        print(f"[NO-OP] rect1に非白なし(X方向): {path.name}")
         return False, "処理不要", None, ""
     
     # 必要な移動量(一番下の非白をrect1の上端より上に出す)
@@ -372,27 +289,26 @@ def process_image_file(
         # ここではNGとする(安全側)
         max_possible = top - cfg.upper_limit_y
         if max_possible <= 0:
-            saved = save_ng_images(img, current, out_dir, path)
-            return saved, "NG", None, "upper-limit"
+            print(f"[NG] 上限超過で移動不可: {path.name}")
+            return False, "NG", None, "upper-limit"
         #
         # キャップして動かす場合は以下を有効に
         # needed = max_possible
         # new_top = top - needed
         print(f"[NG] 必要な移動量が上限を超える: {path.name} needed={needed}")
-        saved = save_ng_images(img, current, out_dir, path)
-        return saved, "NG", None, "upper-limit"
+        return False, "NG", None, "upper-limit"
     
     # 移動対象矩形を決定
-    left_x = max(left_floor, left)
+    left_x = cfg.left_limit_x
+    right_x = cfg.right_limit_x if cfg.right_limit_x is not None else width
     #
     # 下端は bottom+1（半開）、上端は top
     move_rect = clip_rect_to_image((left_x, top, right_x, bottom + 1), width, height)
     if move_rect is None:
-        saved = save_ng_images(img, current, out_dir, path)
-        return saved, "NG", None, "invalid-move-rect"
+        return False, "処理不要", None, "移動矩形無効"
     #
     # 一発シフト
-    current = shift_rect_up_and_fill_white(current, move_rect, needed)
+    current = shift_rect_up_and_fill_white(img, move_rect, needed)
     moved = needed
     
     # y_space 追加
@@ -413,8 +329,7 @@ def process_image_file(
         else:
             # y_space を足すと上限超過 → NG にする
             # print(f"[WARN] y_spaceを追加すると上限超過のためスキップ: {path.name}")
-            saved = save_ng_images(img, current, out_dir, path)
-            return saved, "NG", moved, "y-space-clip-failed"
+            return False, "NG", moved, "y-space-clip-failed"
     
     # 保存
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -479,7 +394,6 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("input_dir", type=Path, help="入力フォルダ")
     ap.add_argument("--rect1", required=True, type=parse_rect, help="監視矩形 x1,y1,x2,y2")
     ap.add_argument("--upper-limit-y", required=True, type=int, help="郵便番号枠下端y（これより上に出ない）")
-    ap.add_argument("--scan-top-y", type=int, default=None, help="走査領域上端y [default=upper-limit-y]")
     ap.add_argument("--sender-zip-rect", required=True, type=parse_rect, help="差出人郵便番号枠")
     ap.add_argument("--left-limit-x", type=int, default=0, help="移動対象左端 [default=0]")
     ap.add_argument("--right-limit-x", type=int, default=None, help="移動対象右端 [default=画像右端]")
@@ -497,7 +411,6 @@ def main():
         input_dir=args.input_dir.resolve(),
         rect1=args.rect1,
         upper_limit_y=args.upper_limit_y,
-        scan_top_y=args.scan_top_y,
         sender_zip_rect=args.sender_zip_rect,
         left_limit_x=args.left_limit_x,
         right_limit_x=args.right_limit_x,
